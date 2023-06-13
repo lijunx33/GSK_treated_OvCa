@@ -1,0 +1,207 @@
+---
+title: "Epic_preprocessing"
+author: "lijunx"
+date: "June 12, 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("minfi")
+library("tidyverse")
+library("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+library("ggplot2")
+```
+
+```{r load file}
+# loading epic array
+raw_data_dir = "raw"
+target = read.metharray.sheet(raw_data_dir)
+RGset <- read.metharray.exp(targets= target, verbose = F, extended = T)
+
+# known bug for epic array with minfi, manually setting the array type
+RGset@annotation=c(array="IlluminaHumanMethylationEPIC",annotation="ilm10b4.hg19")
+```
+#QC with funcnorm and BGcorr
+Normalisation should not be affected by sample, hence all samples are included in this step 
+```{r QC and normalisation}
+# QC - pre-normalisation
+pdf("plots/QC_pre_norm_densityBean.pdf")
+par(mar=c(5,10,4,2))
+densityBeanPlot(RGset,sampNames = pData(RGset)$Sample_Name)
+dev.off()
+
+#1000 most variable postion 2d projection prior to normalisation
+pdf("plots/QC_pre_norm_1000_most_variable_position_MDS.pdf")
+mdsPlot(RGset, sampNames = pData(RGset)$Sample_Name)
+dev.off()
+
+# normalisation
+RGset_prep <- preprocessFunnorm(RGset)
+norm_beta <- getBeta(RGset_prep)
+colnames(norm_beta) <- pData(RGset_prep)$Sample_Name
+
+# QC - post-normalisation
+pdf("plots/QC_post_norm_1000_most_variable_position_MDS.pdf")
+mdsPlot(norm_beta, sampNames = colnames(norm_beta))
+dev.off()
+
+pdf("plots/QC_pos_norm_densityBean.pdf")
+par(mar=c(5,10,4,2))
+densityBeanPlot(norm_beta,sampNames = colnames(norm_beta))
+dev.off()
+```
+62 parent is the untreated baseline methylation level 
+62GSK5 is the treated cell line with one dose of GSK5, the followed suffix of 1, 2, 3, 4 suggested for 4 different timepoints post treatment recovery.
+Here, we want to test whether cellline return to the baseline post treatment recovery
+
+interestingly, we can already see something from the MDS plot
+1-4 timepoints cluster together that is distant from 62 parent, suggesting no full recovery
+if that's the case, then I am wondering how different it is between timepoint 1 and 4
+
+since they have been normalised, lets use 0.25 as the cut-off to extract location that has been changing overtime :)
+```{r}
+timeseries = c("62_parent", "62GSK5_FB_1", "62GSK5_FB_2", "62GSK5_FB_3", "62GSK5_FB_4")
+comparison = as.data.frame(norm_beta[,timeseries])
+
+changed_CpG <- comparison %>%
+  mutate(bl_1 = if_else(abs(`62GSK5_FB_1` - `62_parent`) >= 0.25, `62GSK5_FB_1` - `62_parent`, 0),
+         bl_2 = if_else(abs(`62GSK5_FB_2` - `62_parent`) >= 0.25, `62GSK5_FB_2` - `62_parent`, 0),
+         bl_3 = if_else(abs(`62GSK5_FB_3` - `62_parent`) >= 0.25, `62GSK5_FB_3` - `62_parent`, 0),
+         bl_4 = if_else(abs(`62GSK5_FB_4` - `62_parent`) >= 0.25, `62GSK5_FB_4` - `62_parent`, 0)) %>%
+  filter(bl_1+bl_2+bl_3+bl_4 != 0)
+```
+
+There are 208 CpGs that have changes over treatment or at least varied from treatment using the cutoff of 0.25
+```{r}
+library("GenomicRanges")
+
+annotation <- getAnnotation(RGset_prep, what = "everything")
+annotation_rows<- c("chr", "pos","Name" "Probe_rs", "Probe_maf", "CpG_rs", "CpG_maf", "SBE_rs", "SBE_maf", "Islands_Name", "Relation_to_Island", "UCSC_RefGene_Name", "UCSC_RefGene_Group", "Phantom4_Enhancers", "Phantom5_Enhancers", "DMR", "HMM_Island", "Regulatory_Feature_Name", "Regulatory_Feature_Group", "GencodeBasicV12_NAME","GencodeCompV12_Group","OpenChromatin_NAME","OpenChromatin_Evidence_Count", "TFBS_NAME", "TFBS_Evidence_Count")
+
+changed_CpG_df <- changed_CpG %>%
+                                               dplyr::select(-starts_with("bl_")) %>%
+                                               rownames_to_column("Name") %>%
+                                               gather(key = "cell_line", value = "beta", -"Name") %>%
+                                               left_join(annotation[rownames(changed_CpG),annotation_rows] %>%
+                                                           as.data.frame(), by = "Name")
+```
+I also extract other anntoations of these 200+CpG, let's have a look
+```{r}
+# location in relation to island
+changed_CpG_df %>%
+  dplyr::select(-c("beta", "cell_line")) %>%
+  distinct() %>%
+  group_by(Relation_to_Island) %>%
+  summarise(n=n())
+
+# location in relation to gene
+changed_CpG_df %>%
+  dplyr::select(-c("beta", "cell_line")) %>%
+  distinct() %>%
+  group_by(UCSC_RefGene_Group)%>%
+  summarise(n=n())
+
+# ?promoter
+changed_CpG_df %>%
+  dplyr::select(-c("beta", "cell_line")) %>%
+  distinct() %>%
+  group_by(Regulatory_Feature_Group)%>%
+  summarise(n=n())
+
+# ?TFBS
+changed_CpG_df %>%
+  dplyr::select(-c("beta", "cell_line")) %>%
+  distinct() %>%
+  mutate(TFBS = if_else(TFBS_NAME == "", "F", "T")) %>%
+  group_by(TFBS) %>%
+  summarise(n=n())
+
+
+# ?open chromatin
+changed_CpG_df %>%
+  dplyr::select(-c("beta", "cell_line")) %>%
+  distinct() %>%
+  mutate(OpenChromatin = if_else(OpenChromatin_NAME == "", "F", "T")) %>%
+  group_by(OpenChromatin) %>%
+  summarise(n=n())
+```
+visualise them on a karyoplot may help with their location?
+```{r plot karyoplot}
+library("karyoploteR")
+
+timeseries_col = c("62_parent" = "black",  "62GSK5_FB_1" = "#d9ed92",  "62GSK5_FB_2" = "#76c893", "62GSK5_FB_3" = "#168aad", "62GSK5_FB_4" = "#1e6091")
+
+changedCpGgrange <- makeGRangesFromDataFrame(changed_CpG_df %>%
+                                               mutate(col = timeseries_col[cell_line]), keep.extra.columns = T, ignore.strand = T, start.field = "pos", end.field = "pos")
+pdf("plots/genomic_loc_changed_CpG_with_treatment.pdf", height = 12, width = 10)
+kp <- plotKaryotype(plot.type = 2, chromosomes = paste0("chr",seq(1:22)))
+kpPoints(kp,data = changedCpGgrange, y = changedCpGgrange@elementMetadata@listData$beta, col =  changedCpGgrange@elementMetadata@listData$col, cex = 0.6)
+kpPlotDensity(kp, data=changedCpGgrange, data.panel=2, col=alpha ("grey", 0.7), r0=0, r1=1)
+legend(x = "bottomright", col = c("black", "#d9ed92", "#76c893","#168aad", "#1e6091"), legend = c("Untreated", "Time Point 1", "Time Point 2", "Time Point 3", "Time Point 4"), cex = 0.8, pch = c(20,20,20,20,20 ))
+dev.off()
+```
+karyoplot are too crowded for the detailed difference
+```{r zoom in difference}
+changed_CpG_df %>%
+  ggplot(aes(y = beta, x = Name, color = cell_line))+
+geom_point()+
+  scale_color_manual(values = timeseries_col)+
+  facet_wrap(~Relation_to_Island, scales = "free")+
+  theme_bw()+
+  theme(legend.position = "bottom", axis.text.x = element_blank(), axis.ticks.x = element_blank())+
+  ggtitle("Beta value at changed CpG probes")
+
+ggsave("plots/absolute_beta_value_at_changedCpG.pdf", height = 6, width = 10)
+
+
+
+timeseries_relative_col = c("bl_1" = "#d9ed92",  "bl_2" = "#76c893", "bl_3" = "#168aad", "bl_4" = "#1e6091")
+changed_CpG %>%
+  dplyr::select(-starts_with("62")) %>%
+  rownames_to_column("Name") %>%
+  gather(key = "comparison", value = "delta_beta", -"Name") %>%
+  left_join(annotation[rownames(changed_CpG),annotation_rows] %>%
+              as.data.frame(), by = "Name") %>%
+  ggplot(aes(y = delta_beta, x = Name, color = comparison))+
+geom_jitter()+
+  scale_color_manual(values = timeseries_relative_col)+
+  facet_wrap(~Relation_to_Island, scales = "free")+
+  geom_hline(yintercept = 0)+
+  theme_bw()+
+  theme(legend.position = "bottom", axis.text.x = element_blank(), axis.ticks.x = element_blank())+
+  ggtitle("Relative Beta value change at changed CpG probes")
+ ggsave("plots/relative_beta_value_at_changedCpG.pdf", height = 6, width = 10) 
+  
+  
+  
+changed_CpG %>%
+  dplyr::select(-starts_with("62")) %>%
+  rownames_to_column("Name") %>%
+  gather(key = "comparison", value = "delta_beta", -"Name") %>%
+  left_join(annotation[rownames(changed_CpG),annotation_rows] %>%
+              as.data.frame(), by = "Name") %>%  
+  group_by(Name) %>%
+  distinct()%>%  
+  summarise(`Methylated to baseline` = sum(delta_beta >0), `Demethylated to baseline` = -sum(delta_beta < 0 ), Relation_to_Island) %>%
+  ungroup() %>%
+  distinct() %>%
+  pivot_longer(col = c("Methylated to baseline", "Demethylated to baseline"), names_to = "change", values_to = "count") %>%
+  ggplot(aes(y = count, x = Name, fill = change))+
+  geom_bar(stat = "identity", position = "stack")+
+  facet_wrap(~Relation_to_Island, scales = "free_x")+
+  geom_hline(yintercept = 0)+
+  theme_bw()+
+  theme(legend.position = "bottom", axis.text.x = element_blank(), axis.ticks.x = element_blank())+
+  ggtitle("Relative Beta value change at changed CpG probes")
+ ggsave("plots/relative_beta_value_at_changedCpG_trend_bar.pdf", height = 6, width = 10) 
+```
+now that I noticed one thing I did not consider. the direction of change.
+The hypothesis would be GSK cause global demethylation
+so we should split changes to demethylation to untreated or methylated to treated 
+
+```{r}
+#dmp between treated and untreated (not the best approach)
+# dmpFinder(norm_beta[,c("62GSK5_FB_1", "62GSK5_FB_2", "62GSK5_FB_3", "62GSK5_FB_4", "62_parent")], pheno = c("treated", "treated", "treated", "treated", "control"), qCutoff = 0.05)
+
+
+```
