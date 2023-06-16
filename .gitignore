@@ -2,3 +2,20 @@
 .Rhistory
 .RData
 .Ruserdata
+#plots
+*.pdf
+*.png
+*.jpeg
+*.tiff
+#raw data
+*.idat
+
+#txt file 
+*.txt
+*.tsv
+*.csv
+
+
+#directory
+raw/*
+plots/*
